@@ -5,9 +5,12 @@ Equivalent SAS Program: sas/05_logistic_regression.sas
 """
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, lit
+from pyspark.sql.functions import (
+    col, when, lit, coalesce, count, mean, udf
+)
+from pyspark.sql.types import DoubleType
 from pyspark.ml.feature import (
-    VectorAssembler, StringIndexer, OneHotEncoder
+    VectorAssembler, StringIndexerModel, OneHotEncoder
 )
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml import Pipeline
@@ -46,21 +49,30 @@ df = df \
 #          and DEBTINC ne . and DELINQ ne . and CLAGE ne .;
 #   run;
 # ------------------------------------------------------------------
+# The complete-case filter covers only the six predictors listed in the SAS
+# DATA step. DEROG, NINQ, JOB and REASON are still used as model predictors
+# (see the MODEL/CLASS statements in the SAS program) but are deliberately not
+# part of the complete-case filter, so records with missing values in those
+# four columns stay in the modeling population.
 modelData = df.filter(
     col("LOAN").isNotNull() &
     col("MORTDUE").isNotNull() &
     col("VALUE").isNotNull() &
     col("DEBTINC").isNotNull() &
     col("DELINQ").isNotNull() &
-    col("CLAGE").isNotNull() &
-    col("DEROG").isNotNull() &
-    col("NINQ").isNotNull() &
-    col("JOB").isNotNull() &
-    col("REASON").isNotNull()
+    col("CLAGE").isNotNull()
 )
 
 # Cast BAD to double for ML
 modelData = modelData.withColumn("label", col("BAD").cast("double"))
+
+# Because JOB and REASON are no longer part of the complete-case filter they
+# can be null. Nulls are mapped to an explicit "(Missing)" category so they
+# form their own level instead of being merged with the reference level.
+MISSING_CATEGORY = "(Missing)"
+modelData = modelData \
+    .withColumn("JOB_CAT", coalesce(col("JOB"), lit(MISSING_CATEGORY))) \
+    .withColumn("REASON_CAT", coalesce(col("REASON"), lit(MISSING_CATEGORY)))
 
 print(f"Modeling dataset size: {modelData.count()} rows")
 
@@ -91,12 +103,44 @@ print(f"Validation set: {valid.count()} rows")
 # ------------------------------------------------------------------
 
 # Index categorical variables (equivalent to CLASS statement)
-jobIndexer = StringIndexer(
-    inputCol="JOB", outputCol="JOB_IDX", handleInvalid="keep"
+#
+# SAS pins the reference levels explicitly: class JOB(ref='Other')
+# REASON(ref='HomeImp') / param=ref. In PySpark the reference level is the
+# category dropped by OneHotEncoder, which is always the LAST index, and the
+# default StringIndexer ordering (descending frequency) is data-driven - so
+# 'Other'/'HomeImp' would not reliably end up as the reference.
+#
+# To pin the reference level we build the StringIndexerModel from an explicit
+# label list that omits the reference category, and keep handleInvalid="keep".
+# The reference category therefore falls into the indexer's trailing
+# "__unknown" bucket, which is exactly the index OneHotEncoder drops - giving
+# the SAS reference level. Limitation: any category unseen when the label list
+# was built (there should be none, as labels come from the full modeling
+# population) is also folded into the reference level.
+def refLastLabels(data, inputCol, refCategory):
+    """Ordered labels for `inputCol` (descending frequency) minus refCategory."""
+    rows = data.groupBy(inputCol).count() \
+        .orderBy(col("count").desc(), col(inputCol).asc()) \
+        .collect()
+    return [r[inputCol] for r in rows if r[inputCol] != refCategory]
+
+
+JOB_REF = "Other"          # SAS: class JOB(ref='Other')
+REASON_REF = "HomeImp"     # SAS: class REASON(ref='HomeImp')
+
+jobLabels = refLastLabels(modelData, "JOB_CAT", JOB_REF)
+reasonLabels = refLastLabels(modelData, "REASON_CAT", REASON_REF)
+
+jobIndexer = StringIndexerModel.from_labels(
+    jobLabels, inputCol="JOB_CAT", outputCol="JOB_IDX", handleInvalid="keep"
 )
-reasonIndexer = StringIndexer(
-    inputCol="REASON", outputCol="REASON_IDX", handleInvalid="keep"
+reasonIndexer = StringIndexerModel.from_labels(
+    reasonLabels, inputCol="REASON_CAT", outputCol="REASON_IDX",
+    handleInvalid="keep"
 )
+
+print(f"JOB levels (reference '{JOB_REF}' dropped): {jobLabels}")
+print(f"REASON levels (reference '{REASON_REF}' dropped): {reasonLabels}")
 
 # One-hot encode categorical variables (equivalent to param=ref)
 jobEncoder = OneHotEncoder(
@@ -113,9 +157,13 @@ numericFeatures = [
 ]
 
 # Assemble all features into a single vector
+# handleInvalid="skip" drops rows with a missing numeric predictor (DEROG or
+# NINQ, which are not part of the complete-case filter), mirroring PROC
+# LOGISTIC, which deletes observations with missing MODEL variables.
 assembler = VectorAssembler(
     inputCols=numericFeatures + ["JOB_VEC", "REASON_VEC"],
-    outputCol="features"
+    outputCol="features",
+    handleInvalid="skip"
 )
 
 # Logistic regression model
@@ -245,23 +293,47 @@ print("Predicted Probability Distribution by Actual Outcome")
 print("=" * 60)
 
 # Extract probability of default (class 1)
-from pyspark.sql.functions import udf
-from pyspark.sql.types import DoubleType
-
 extractProb = udf(lambda v: float(v[1]), DoubleType())
 predictions = predictions.withColumn("pred_prob", extractProb(col("probability")))
 
 predictions.groupBy("label") \
     .agg(
-        {"pred_prob": "count", "pred_prob": "mean"}
+        count("pred_prob").alias("n"),
+        mean("pred_prob").alias("mean_pred_prob")
     ) \
+    .orderBy("label") \
     .show()
 
 # Detailed statistics
+# describe() reports n, mean, std, min and max; PROC MEANS also reports p25,
+# median and p75, so the quartiles are computed with approxQuantile.
 for labelVal in [0.0, 1.0]:
     subset = predictions.filter(col("label") == labelVal)
     print(f"\nActual BAD = {int(labelVal)}:")
     subset.select("pred_prob").describe().show()
+
+    p25, median, p75 = subset.approxQuantile(
+        "pred_prob", [0.25, 0.5, 0.75], 0.001
+    )
+    print(f"  p25:    {p25:.6f}")
+    print(f"  median: {median:.6f}")
+    print(f"  p75:    {p75:.6f}")
+
+# ------------------------------------------------------------------
+# Step 9: Persist output artifacts
+# SAS equivalent:
+#   store work.logit_model;                  -> saved pipeline model
+#   output out=work.valid_scored ...;        -> scored validation predictions
+# ------------------------------------------------------------------
+MODEL_PATH = "output/logit_model"
+PREDICTIONS_PATH = "output/valid_scored"
+
+model.write().overwrite().save(MODEL_PATH)
+print(f"\nSaved fitted pipeline model to {MODEL_PATH}")
+
+predictions.select("label", "prediction", "pred_prob") \
+    .write.mode("overwrite").csv(PREDICTIONS_PATH, header=True)
+print(f"Saved scored validation predictions to {PREDICTIONS_PATH}")
 
 # Clean up
 spark.stop()
