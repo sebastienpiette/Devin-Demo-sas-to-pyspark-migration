@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Artifacts written by pyspark/05_logistic_regression.py
+output/
